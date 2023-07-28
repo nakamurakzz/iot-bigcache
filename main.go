@@ -3,18 +3,23 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"time"
 
+	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"golang.org/x/sync/errgroup"
 )
 
-const uri = "mongodb://root:example@mongo:27017"
+const (
+	uri        = "mongodb://root:example@mongo:27017"
+	database   = "Sensor"
+	collection = "Sensor"
+)
 
 func main() {
 	if run() != 0 {
-		fmt.Println("failed")
 		return
 	}
 }
@@ -25,50 +30,155 @@ func run() int {
 		failure
 	)
 
-	opt := options.Client().ApplyURI(uri).SetConnectTimeout(5 * time.Second)
+	opt := options.Client().ApplyURI(uri).SetConnectTimeout(5 * time.Second).SetMaxConnecting(5)
 	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	fmt.Printf("connect to mongo: %s\n", uri)
 
-	mongoClient, err := mongo.Connect(ctx, opt)
+	client, err := mongo.Connect(ctx, opt)
+	defer func() {
+		err = client.Disconnect(ctx)
+		if err != nil {
+			fmt.Printf("failed to disconnect mongo: %v\n", err)
+		}
+	}()
+
 	if err != nil {
-		fmt.Printf("failed to connect to mongo: %v", err)
+		fmt.Printf("failed to connect to mongo: %v\n", err)
 		return failure
 	}
-	defer mongoClient.Disconnect(ctx)
 
-	err = mongoClient.Ping(ctx, nil)
+	err = client.Ping(ctx, nil)
 	if err != nil {
-		fmt.Printf("failed to ping mongo: %v", err)
+		fmt.Printf("failed to ping mongo: %v\n", err)
 		return failure
 	}
-
 	fmt.Println("Connect Success.")
 
-	database := mongoClient.Database("Test")
-	_, err = database.Collection("Collection").InsertOne(ctx, map[string]string{"key": "value"})
-	if err != nil {
-		fmt.Printf("failed to insert: %v", err)
-		return failure
-	}
-
-	errgroup, ctx := errgroup.WithContext(ctx)
-	errgroup.Go(func() error {
+	go func() {
+		// insert and get length by 3 seconds interval
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				fmt.Println("Hello")
-				time.Sleep(1 * time.Second)
+				return
+			case <-ticker.C:
+				sensor, err := getSensor()
+				if err != nil {
+					fmt.Printf("failed to get sensor data: %v\n", err)
+				}
+				err = insertSensorData(ctx, client, *sensor)
+				if err != nil {
+					fmt.Printf("failed to insert sensor data: %v\n", err)
+				}
 			}
 		}
-	})
-	err = errgroup.Wait()
+	}()
+
+	go func() {
+		// get length by 5 seconds interval
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				count, err := getCount(ctx, client)
+				if err != nil {
+					fmt.Printf("failed to getCount: %v\n", err)
+				}
+				fmt.Printf("sensor data length: %d\n", count)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		// get length by 5 seconds interval
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sensors, err := findSensor(ctx, client)
+				if err != nil {
+					fmt.Printf("failed to findSensor: %v\n", err)
+				}
+				fmt.Printf("sensors: %v\n", sensors)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	<-ctx.Done()
+
+	fmt.Println("finished")
 	if err != nil {
 		fmt.Printf("failed to wait: %v", err)
 		return failure
 	}
 
 	return success
+}
+
+type Sensor struct {
+	ID       string `bson:"_id"`
+	Humidity int    `bson:"humidity"`
+	Temp     int    `bson:"temp"`
+	HasSent  bool   `bson:"hasSent"`
+}
+
+func NewSensor() *Sensor {
+	return &Sensor{
+		ID:       uuid.New().String(),
+		Humidity: rand.Intn(100),
+		Temp:     rand.Intn(50),
+		HasSent:  false,
+	}
+}
+
+func getSensor() (*Sensor, error) {
+	sensor := NewSensor()
+	return sensor, nil
+}
+
+func insertSensorData(ctx context.Context, client *mongo.Client, sensor Sensor) error {
+	collection := client.Database(database).Collection(collection)
+	fmt.Printf("data: %v\n", sensor)
+	_, err := collection.InsertOne(ctx, sensor)
+	if err != nil {
+		return fmt.Errorf("failed to insert sensor data: %v", err)
+	}
+	return nil
+}
+
+func getCount(ctx context.Context, client *mongo.Client) (int64, error) {
+	collection := client.Database(database).Collection(collection)
+	filter := bson.D{{}}
+	count, err := collection.CountDocuments(ctx, filter)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count collection: %v", err)
+	}
+	return count, nil
+}
+
+func findSensor(ctx context.Context, client *mongo.Client) ([]bson.Raw, error) {
+	collection := client.Database(database).Collection(collection)
+	filter := bson.D{{Key: "HasSent", Value: "false"}}
+	findOpt := options.Find()
+
+	doc, err := collection.Find(ctx, filter, findOpt)
+	fmt.Printf("doc: %v\n", doc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count collection: %v", err)
+	}
+	var sensors []bson.Raw
+	if err = doc.All(ctx, &sensors); err != nil {
+		return nil, fmt.Errorf("failed to decode sensor data: %v", err)
+	}
+	return sensors, nil
 }
