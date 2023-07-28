@@ -5,10 +5,11 @@ FROM golang:1.20.6-alpine3.18
 WORKDIR /app
 
 COPY go.mod ./
+COPY go.sum ./
 
-RUN go mod tidy
+RUN go mod download
 
-COPY *.go ./
+COPY main.go ./
 
 RUN go build -o /main
 
